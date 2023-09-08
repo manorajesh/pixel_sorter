@@ -12,11 +12,11 @@ use rand::thread_rng;
 fn main() {
     env_logger::builder().filter_level(LevelFilter::Info).init();
     let event_loop = EventLoop::new();
-    let img = image::open("birds.png").unwrap().to_rgb8();
+    let img = image::open("mano.png").unwrap().to_rgb8();
     let img_width = img.width();
     let img_height = img.height();
     let mut img_buf = img.into_raw();
-    let mut threshold = 100u8;
+    let mut threshold = 100;
     let mut rgba_img_buf = pixel_sort(&mut img_buf, img_width as usize, img_height as usize, threshold);
 
     // Rest of the code
@@ -36,6 +36,8 @@ fn main() {
     // Initialize ControlFlow as Wait
     let mut control_flow = ControlFlow::Wait;
 
+    let mut temp_img_buf = img_buf.clone();
+
     event_loop.run(move |event, _, control_flow_ptr| {
         *control_flow_ptr = control_flow;
 
@@ -50,18 +52,19 @@ fn main() {
             } => {
                 if let Some(key_code) = input.virtual_keycode {
                     match key_code {
-                        VirtualKeyCode::Left => {
-                            log::info!("Reducing threshold");
-                            threshold = threshold.saturating_sub(1);
-                            rgba_img_buf = pixel_sort(&mut img_buf.clone(), img_width as usize, img_height as usize, threshold);
+                        VirtualKeyCode::Left | VirtualKeyCode::Right => {
+                            if key_code == VirtualKeyCode::Left {
+                                log::info!("Reducing threshold");
+                                threshold = threshold.saturating_sub(1);
+                            } else {
+                                log::info!("Increasing threshold");
+                                threshold = threshold.saturating_add(1);
+                            }
+                            temp_img_buf.copy_from_slice(&img_buf);
+                            rgba_img_buf = pixel_sort(&mut temp_img_buf, img_width as usize, img_height as usize, threshold);
                             log::info!("Threshold: {}", threshold);
-                            window.request_redraw();
-                        }
-                        VirtualKeyCode::Right => {
-                            log::info!("Increasing threshold");
-                            threshold = threshold.saturating_add(1);
-                            rgba_img_buf = pixel_sort(&mut img_buf.clone(), img_width as usize, img_height as usize, threshold);
-                            log::info!("Threshold: {}", threshold);
+
+                            // Request redraw only once here
                             window.request_redraw();
                         }
                         _ => (),
@@ -93,16 +96,15 @@ fn main() {
 }
 
 fn pixel_sort(img_buf: &mut Vec<u8>, img_width: usize, img_height: usize, threshold: u8) -> Vec<u8> {
-    // Create a mask based on blue channel threshold
     let mask: Vec<bool> = img_buf
         .chunks_exact(3)
-        .map(|pixel| pixel[2] > threshold)
+        .map(|pixel| pixel[0] > threshold)
         .collect();
 
-    let mut rgba_img_buf = Vec::with_capacity(img_width * img_height * 4);
-    let mut rng = thread_rng();  // Create a random number generator
-
-    for row in 0..img_height {
+    // Use rayon's par_iter to parallelize row processing.
+    let rows: Vec<Vec<u8>> = (0..img_height).into_par_iter().map(|row| {
+        let mut rng = thread_rng();  // Create a random number generator
+        let mut rgba_row_buf = Vec::new();
         let mut segment = Vec::new();
 
         for i in (row * img_width)..((row + 1) * img_width) {
@@ -110,32 +112,40 @@ fn pixel_sort(img_buf: &mut Vec<u8>, img_width: usize, img_height: usize, thresh
                 segment.push([img_buf[i * 3], img_buf[i * 3 + 1], img_buf[i * 3 + 2]]);
             } else {
                 if !segment.is_empty() {
-                    segment.sort_by(|a, b| a[2].cmp(&b[2]));
+                    segment.sort_by(|b, a| a[2].cmp(&b[2]));
 
-                    // Shuffle part of the sorted segment for randomness
+                    // Shuffle part of the sorted segment
                     let shuffle_start = (segment.len() as f64 * 0.3).round() as usize;
                     let shuffle_end = (segment.len() as f64 * 0.7).round() as usize;
                     segment[shuffle_start..shuffle_end].shuffle(&mut rng);
 
                     for pixel in segment.iter() {
-                        rgba_img_buf.extend_from_slice(pixel);
-                        rgba_img_buf.push(255); // Alpha channel
+                        rgba_row_buf.extend_from_slice(pixel);
+                        rgba_row_buf.push(255);  // Alpha channel
                     }
                     segment.clear();
                 }
-                rgba_img_buf.extend_from_slice(&img_buf[i * 3..(i * 3 + 3)]);
-                rgba_img_buf.push(255); // Alpha channel
+                rgba_row_buf.extend_from_slice(&img_buf[i * 3..(i * 3 + 3)]);
+                rgba_row_buf.push(255);  // Alpha channel
             }
         }
 
         if !segment.is_empty() {
-            segment.sort_by(|a, b| a[2].cmp(&b[2]));
+            segment.sort_by(|b, a| a[2].cmp(&b[2]));
             for pixel in segment.iter() {
-                rgba_img_buf.extend_from_slice(pixel);
-                rgba_img_buf.push(255); // Alpha channel
+                rgba_row_buf.extend_from_slice(pixel);
+                rgba_row_buf.push(255);  // Alpha channel
             }
         }
+        rgba_row_buf
+    }).collect();
+
+    // Concatenate all the rows to form the complete image.
+    let mut rgba_img_buf = Vec::with_capacity(img_width * img_height * 4);
+    for row in rows {
+        rgba_img_buf.extend(row);
     }
+
     rgba_img_buf
 }
 
