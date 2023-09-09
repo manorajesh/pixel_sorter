@@ -1,3 +1,5 @@
+use std::time::{Instant, Duration};
+
 use log::LevelFilter;
 use rand::prelude::SliceRandom;
 use rand::thread_rng;
@@ -8,12 +10,12 @@ use show_image::{create_window, event, ImageInfo, ImageView};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(LevelFilter::Warn).init();
 
-    let path = "images/break.jpg";
+    let path = "images/mano.png";
     let img = image::open(path).unwrap().to_rgb8();
     let img_width = img.width();
     let img_height = img.height();
     let mut img_buf = img.into_raw();
-    let mut threshold = 100;
+    let mut threshold = Threshold { high: 255, low: 0 };
     let mut rgba_img_buf = pixel_sort(
         &mut img_buf,
         img_width as usize,
@@ -27,15 +29,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = create_window(path, Default::default())?;
     window.set_image("image-001", image)?;
 
+    let mut last_keypress_time = Instant::now();
+    let debounce_duration = Duration::from_millis(25);  // Adjust this value
+
     for event in window.event_channel()? {
         if let event::WindowEvent::KeyboardInput(event) = event {
-            if event.input.state.is_pressed() {
+            if event.input.state.is_pressed() && Instant::now().duration_since(last_keypress_time) > debounce_duration {
                 match event.input.key_code {
                     Some(event::VirtualKeyCode::Escape) => break,
                     Some(event::VirtualKeyCode::Left) => {
-                        log::warn!("Reducing threshold");
+                        log::warn!("Reducing low threshold");
 
-                        threshold = threshold.saturating_sub(1);
+                        threshold.decrease_low();
                         rgba_img_buf = pixel_sort(
                             &mut img_buf.clone(),
                             img_width as usize,
@@ -48,12 +53,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ImageView::new(ImageInfo::rgb8(img_width, img_height), &rgba_img_buf),
                         )?;
 
-                        log::warn!("Threshold: {}", threshold);
+                        log::warn!("Threshold: {:?}", threshold);
                     }
                     Some(event::VirtualKeyCode::Right) => {
-                        log::warn!("Increasing threshold");
+                        log::warn!("Increasing low threshold");
 
-                        threshold = threshold.saturating_add(1);
+                        threshold.increase_low();
                         rgba_img_buf = pixel_sort(
                             &mut img_buf.clone(),
                             img_width as usize,
@@ -66,10 +71,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ImageView::new(ImageInfo::rgb8(img_width, img_height), &rgba_img_buf),
                         )?;
 
-                        log::warn!("Threshold: {}", threshold);
+                        log::warn!("Threshold: {:?}", threshold);
+                    }
+                    Some(event::VirtualKeyCode::Down) => {
+                        log::warn!("Reducing high threshold");
+
+                        threshold.decrease_high();
+                        rgba_img_buf = pixel_sort(
+                            &mut img_buf.clone(),
+                            img_width as usize,
+                            img_height as usize,
+                            threshold,
+                        );
+
+                        window.set_image(
+                            "image-001",
+                            ImageView::new(ImageInfo::rgb8(img_width, img_height), &rgba_img_buf),
+                        )?;
+
+                        log::warn!("Threshold: {:?}", threshold);
+                    }
+                    Some(event::VirtualKeyCode::Up) => {
+                        log::warn!("Increasing high threshold");
+
+                        threshold.increase_high();
+                        rgba_img_buf = pixel_sort(
+                            &mut img_buf.clone(),
+                            img_width as usize,
+                            img_height as usize,
+                            threshold,
+                        );
+
+                        window.set_image(
+                            "image-001",
+                            ImageView::new(ImageInfo::rgb8(img_width, img_height), &rgba_img_buf),
+                        )?;
+
+                        log::warn!("Threshold: {:?}", threshold);
                     }
                     _ => (),
                 }
+                last_keypress_time = Instant::now();
             }
         }
     }
@@ -81,11 +123,11 @@ fn pixel_sort(
     img_buf: &mut Vec<u8>,
     img_width: usize,
     img_height: usize,
-    threshold: u8,
+    threshold: Threshold,
 ) -> Vec<u8> {
     let mask: Vec<bool> = img_buf
-        .chunks_exact(3)
-        .map(|pixel| pixel[0] > threshold)
+        .par_chunks_exact(3)
+        .map(|pixel| pixel[0] < threshold.low || pixel[0] > threshold.high)
         .collect();
 
     // Use rayon's par_iter to parallelize row processing.
@@ -131,12 +173,7 @@ fn pixel_sort(
         .collect();
 
     // Concatenate all the rows to form the complete image.
-    let mut rgba_img_buf = Vec::with_capacity(img_width * img_height * 4);
-    for row in rows {
-        rgba_img_buf.extend(row);
-    }
-
-    rgba_img_buf
+    rows.into_iter().flatten().collect::<Vec<u8>>()
 }
 
 trait GetLuma {
@@ -147,5 +184,29 @@ impl GetLuma for &[u8] {
     fn get_luma(&self) -> u8 {
         let [r, g, b] = self else { panic!("Pixel is not RGB") };
         (0.2126 * *r as f32 + 0.7152 * *g as f32 + 0.0722 * *b as f32) as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Threshold {
+    high: u8,
+    low: u8,
+}
+
+impl Threshold {
+    fn increase_high(&mut self) {
+        self.high = self.high.saturating_add(1);
+    }
+
+    fn decrease_high(&mut self) {
+        self.high = self.high.saturating_sub(1);
+    }
+
+    fn increase_low(&mut self) {
+        self.low = self.low.saturating_add(1);
+    }
+
+    fn decrease_low(&mut self) {
+        self.low = self.low.saturating_sub(1);
     }
 }
