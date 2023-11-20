@@ -3,20 +3,15 @@
 ![Build Status](https://github.com/manorajesh/mandelbrot-rs/actions/workflows/Linux.yml/badge.svg)
 ![Build Status](https://github.com/manorajesh/mandelbrot-rs/actions/workflows/Windows.yml/badge.svg)
 
-Rustily interact with the mandelbrot set *__with the GPU!__*
-
-![Demo Picture](https://github.com/manorajesh/mandelbrot-rs/blob/wgpu/images/demo1.png)
+WIP
 
 ## Installation
 ```shell
-git clone https://github.com/manorajesh/mandelbrot-rs.git && cd mandelbrot-rs
-cargo run --release
+WIP
 ```
 
 ## Usage
-At startup, the mouse is captured and can be used to translate the viewport with the scroll whell being used to, you guessed it, zoom.
-Press the spacebar to toggle mouse captivity. Use the `up` and `down` arrow keys to increase and decrease the iteration count
-(i.e. detail) of the mandelbrot respectively. If you want to leave, press `esc`.
+WIP
 
 ## Why
 Idea popped into my mind during a creative lull. Seemed easy enough while also pushing me along my graphics journey.
