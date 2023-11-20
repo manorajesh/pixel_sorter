@@ -10,7 +10,7 @@ use show_image::{create_window, event, ImageInfo, ImageView};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder().filter_level(LevelFilter::Warn).init();
 
-    let path = "images/mano.png";
+    let path = "images/frontrow.jpg";
     let img = image::open(path).unwrap().to_rgb8();
     let img_width = img.width();
     let img_height = img.height();
@@ -127,7 +127,7 @@ fn pixel_sort(
 ) -> Vec<u8> {
     let mask: Vec<bool> = img_buf
         .par_chunks_exact(3)
-        .map(|pixel| pixel[0] < threshold.low || pixel[0] > threshold.high)
+        .map(|pixel| pixel[0] <= threshold.low || pixel[0] >= threshold.high)
         .collect();
 
     // Use rayon's par_iter to parallelize row processing.
