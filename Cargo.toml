@@ -16,3 +16,5 @@ wgpu = "0.16"
 pollster = "0.3.0"
 bytemuck = { version = "1.13.1", features = ["derive"] }
 rand = "0.8.5"
+egui = "0.29.1"
+eframe = "0.29.1"
