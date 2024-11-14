@@ -11,69 +11,37 @@ use rayon::prelude::*;
 use std::sync::{ Arc, Mutex };
 use std::path::PathBuf;
 use rfd::FileDialog; // Import rfd for file dialogs
+use std::thread;
 
-/// Your original pixel_sort function remains unchanged
-fn pixel_sort(img_buf: &[u8], img_width: usize, img_height: usize, threshold: u8) -> Vec<u8> {
-    let mask: Vec<bool> = img_buf
-        .chunks_exact(3)
-        .map(|pixel| pixel[0] > threshold)
-        .collect();
+use pollster::block_on;
 
-    // Use rayon's par_iter to parallelize row processing.
-    let rows: Vec<Vec<u8>> = (0..img_height)
-        .into_par_iter()
-        .map(|row| {
-            let mut rng = thread_rng(); // Create a random number generator
-            let mut rgba_row_buf = Vec::new();
-            let mut segment = Vec::new();
+// Include the GPU module
+mod gpu;
+use gpu::GPUDevice;
 
-            for i in row * img_width..(row + 1) * img_width {
-                if mask[i] {
-                    segment.push([img_buf[i * 3], img_buf[i * 3 + 1], img_buf[i * 3 + 2]]);
-                } else {
-                    if !segment.is_empty() {
-                        segment.sort_by(|a, b| a[2].cmp(&b[2]));
+// Define Pixel and Params structs
+use bytemuck::{ Pod, Zeroable };
 
-                        // Shuffle part of the sorted segment
-                        let shuffle_start = ((segment.len() as f64) * 0.3).round() as usize;
-                        let shuffle_end = ((segment.len() as f64) * 0.7).round() as usize;
-                        if shuffle_start < shuffle_end && shuffle_end <= segment.len() {
-                            segment[shuffle_start..shuffle_end].shuffle(&mut rng);
-                        }
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct Pixel {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
 
-                        for pixel in segment.iter() {
-                            rgba_row_buf.extend_from_slice(pixel);
-                            rgba_row_buf.push(255); // Alpha channel
-                        }
-                        segment.clear();
-                    }
-                    rgba_row_buf.extend_from_slice(&img_buf[i * 3..i * 3 + 3]);
-                    rgba_row_buf.push(255); // Alpha channel
-                }
-            }
-
-            if !segment.is_empty() {
-                segment.sort_by(|a, b| a[2].cmp(&b[2]));
-                for pixel in segment.iter() {
-                    rgba_row_buf.extend_from_slice(pixel);
-                    rgba_row_buf.push(255); // Alpha channel
-                }
-            }
-            rgba_row_buf
-        })
-        .collect();
-
-    // Concatenate all the rows to form the complete image.
-    let mut rgba_img_buf = Vec::with_capacity(img_width * img_height * 4);
-    for row in rows {
-        rgba_img_buf.extend(row);
-    }
-
-    rgba_img_buf
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct Params {
+    img_width: u32,
+    img_height: u32,
+    threshold: u32,
 }
 
 /// Struct representing the application state
 struct MyApp {
+    gpu: GPUDevice,
     processed_image: Arc<Mutex<Vec<u8>>>,
     texture: Option<TextureHandle>,
     threshold: u8,
@@ -88,6 +56,9 @@ impl Default for MyApp {
     fn default() -> Self {
         // Initialize logging
         env_logger::builder().filter_level(LevelFilter::Info).init();
+
+        // Initialize GPU
+        let gpu = GPUDevice::new();
 
         // Optionally, load a default image at startup
         let default_image_path = ""; // Change this to your default image path
@@ -113,18 +84,24 @@ impl Default for MyApp {
         // Initial threshold
         let threshold = 100;
 
-        // Process the image
-        let processed_image = pixel_sort(&original_img_buf, img_width, img_height, threshold);
+        // Initialize processed_image and processing flag
+        let processed_image = Arc::new(Mutex::new(Vec::new()));
+        let is_processing = Arc::new(Mutex::new(false));
 
         Self {
-            processed_image: Arc::new(Mutex::new(processed_image)),
+            gpu,
+            processed_image,
             texture: None,
             threshold,
             img_width,
             img_height,
             original_img_buf,
-            image_path: Some(PathBuf::from(default_image_path)),
-            is_processing: Arc::new(Mutex::new(false)),
+            image_path: if default_image_path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(default_image_path))
+            },
+            is_processing,
         }
     }
 }
@@ -140,6 +117,8 @@ impl eframe::App for MyApp {
                         // Optionally, show a popup or notification to the user
                     } else {
                         info!("Loaded image '{}'", path.display());
+                        // Start GPU processing for the new image
+                        self.process_image_async();
                     }
                 }
             }
@@ -169,7 +148,7 @@ impl eframe::App for MyApp {
             ui.add_space(10.0);
 
             // Instructions for drag-and-drop
-            if self.texture.is_none() {
+            if self.texture.is_none() && !*self.is_processing.lock().unwrap() {
                 ui.horizontal_centered(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.label("Drag and drop an image here");
@@ -193,15 +172,15 @@ impl eframe::App for MyApp {
             ui.separator();
 
             // Check if the slider value has changed
-            if slider.changed() {
+            if slider.changed() && !*self.is_processing.lock().unwrap() {
                 info!("Threshold changed to {}", self.threshold);
-                self.process_image();
+                self.process_image_async();
             }
 
             ui.add_space(10.0);
 
             // Load the texture if not already loaded or if it needs to be updated
-            if self.texture.is_none() {
+            if self.texture.is_none() && !*self.is_processing.lock().unwrap() {
                 if let Some(texture) = self.load_texture(ui) {
                     self.texture = Some(texture);
                 }
@@ -229,7 +208,7 @@ impl eframe::App for MyApp {
 }
 
 impl MyApp {
-    /// Load an image from the given path and process it
+    /// Load an image from the given path and update the application state
     fn load_image_from_path(&mut self, path: &PathBuf) -> Result<(), image::ImageError> {
         // Attempt to open the image
         let img = image::open(path)?;
@@ -242,51 +221,250 @@ impl MyApp {
         let img_rgb = img.to_rgb8();
         self.original_img_buf = img_rgb.into_raw();
 
-        // Process the image with the current threshold
-        self.process_image();
-
         // Update the image path
         self.image_path = Some(path.clone());
-
-        Ok(())
-    }
-
-    /// Process the image using the pixel_sort function
-    fn process_image(&mut self) {
-        // Set the processing flag
-        {
-            let mut processing = self.is_processing.lock().unwrap();
-            *processing = true;
-        }
-
-        // Perform the pixel sort
-        let new_image = pixel_sort(
-            &self.original_img_buf,
-            self.img_width,
-            self.img_height,
-            self.threshold
-        );
-
-        // Update the processed image buffer
-        {
-            let mut img = self.processed_image.lock().unwrap();
-            *img = new_image;
-        }
 
         // Reset the texture to force reload
         self.texture = None;
 
-        // Unset the processing flag
-        {
-            let mut processing = self.is_processing.lock().unwrap();
-            *processing = false;
+        Ok(())
+    }
+
+    fn create_gpu_buffers(
+        &self,
+        device: &wgpu::Device,
+        img_buf: &[u8],
+        img_width: usize,
+        img_height: usize,
+        threshold: u8
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
+        // Convert input buffer to Pixel array
+        let input_pixels: Vec<Pixel> = img_buf
+            .chunks_exact(3)
+            .map(|chunk| Pixel {
+                r: chunk[0],
+                g: chunk[1],
+                b: chunk[2],
+                a: 255, // Initialize alpha channel
+            })
+            .collect();
+
+        let input_buffer = device.create_buffer(
+            &(wgpu::BufferDescriptor {
+                label: Some("Input Image Buffer"),
+                size: (img_width *
+                    img_height *
+                    std::mem::size_of::<Pixel>()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        );
+
+        let output_buffer = device.create_buffer(
+            &(wgpu::BufferDescriptor {
+                label: Some("Output Image Buffer"),
+                size: (img_width *
+                    img_height *
+                    std::mem::size_of::<Pixel>()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        );
+
+        // Create uniform buffer
+        let params = Params {
+            img_width: img_width as u32,
+            img_height: img_height as u32,
+            threshold: threshold as u32,
+        };
+
+        let uniform_buffer = device.create_buffer(
+            &(wgpu::BufferDescriptor {
+                label: Some("Uniform Buffer"),
+                size: std::mem::size_of::<Params>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        );
+
+        (input_buffer, output_buffer, uniform_buffer)
+    }
+
+    /// Process the image using GPU-based pixel sorting asynchronously
+    fn process_image_async(&mut self) {
+        // Prevent multiple simultaneous processing tasks
+        let already_processing = {
+            let processing = self.is_processing.lock().unwrap();
+            *processing
+        };
+
+        if already_processing {
+            info!("Already processing an image. Please wait.");
+            return;
         }
+
+        let processed_image = Arc::clone(&self.processed_image);
+        let is_processing = Arc::clone(&self.is_processing);
+        let gpu = self.gpu.device;
+        let queue = self.gpu.queue;
+        let original_img_buf = self.original_img_buf.clone();
+        let img_width = self.img_width;
+        let img_height = self.img_height;
+        let threshold = self.threshold;
+
+        // Set the processing flag
+        {
+            let mut processing = is_processing.lock().unwrap();
+            *processing = true;
+        }
+
+        // Spawn a new thread for GPU processing
+        thread::spawn(move || {
+            // Create buffers
+            let (input_buffer, output_buffer, uniform_buffer) = self.create_gpu_buffers(
+                &gpu,
+                &original_img_buf,
+                img_width,
+                img_height,
+                threshold
+            );
+
+            // Load shader
+            let shader = {
+                let shader_source = include_str!("shaders/pixel_sort.wgsl");
+                gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Pixel Sort Shader"),
+                    source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+                })
+            };
+
+            // Create compute pipeline
+            let pipeline = gpu.create_compute_pipeline(
+                &(wgpu::ComputePipelineDescriptor {
+                    label: Some("Pixel Sort Compute Pipeline"),
+                    layout: None, // Let wgpu auto-create the pipeline layout
+                    module: &shader,
+                    entry_point: "main",
+                })
+            );
+
+            // Create bind group
+            let bind_group = gpu.create_bind_group(
+                &(wgpu::BindGroupDescriptor {
+                    label: Some("Pixel Sort Bind Group"),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: input_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: output_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                    ],
+                })
+            );
+
+            // Dispatch the compute shader
+            let mut encoder = gpu.create_command_encoder(
+                &(wgpu::CommandEncoderDescriptor {
+                    label: Some("Compute Command Encoder"),
+                })
+            );
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(
+                    &(wgpu::ComputePassDescriptor {
+                        label: Some("Pixel Sort Compute Pass"),
+                    })
+                );
+                compute_pass.set_pipeline(&pipeline);
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+
+                // Dispatch one workgroup per row
+                compute_pass.dispatch_workgroups(img_height as u32, 1, 1);
+            }
+
+            // Submit the command buffer
+            queue.submit(Some(encoder.finish()));
+
+            // Read back the data
+            let buffer_size = img_width * img_height * std::mem::size_of::<Pixel>();
+            let output_data = block_on(
+                MyApp::read_output_buffer_static(&gpu, &queue, &output_buffer, buffer_size)
+            );
+
+            // Update the processed_image buffer
+            {
+                let mut img = processed_image.lock().unwrap();
+                *img = output_data;
+            }
+
+            // Unset the processing flag
+            {
+                let mut processing = is_processing.lock().unwrap();
+                *processing = false;
+            }
+
+            info!("GPU processing completed.");
+        });
+    }
+
+    /// Static version to be called within a thread
+    async fn read_output_buffer_static(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        size: usize
+    ) -> Vec<u8> {
+        // Create a buffer to copy the data to
+        let read_buffer = device.create_buffer(
+            &(wgpu::BufferDescriptor {
+                label: Some("Read Buffer"),
+                size: size as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        );
+
+        // Create a command encoder
+        let mut encoder = device.create_command_encoder(
+            &(wgpu::CommandEncoderDescriptor {
+                label: Some("Read Buffer Encoder"),
+            })
+        );
+
+        // Copy the data from the output buffer to the read buffer
+        encoder.copy_buffer_to_buffer(buffer, 0, &read_buffer, 0, size as wgpu::BufferAddress);
+
+        // Submit the copy command
+        queue.submit(Some(encoder.finish()));
+
+        // Wait for the GPU to finish
+        let buffer_slice = read_buffer.slice(..);
+        buffer_slice.map_async(wgpu::MapMode::Read, |i| { i.unwrap() });
+        device.poll(wgpu::Maintain::Wait);
+
+        // Read the data
+        let data = buffer_slice.get_mapped_range().to_vec();
+        read_buffer.unmap();
+
+        data
     }
 
     /// Load the texture from the processed image buffer
     fn load_texture(&self, ui: &mut egui::Ui) -> Option<TextureHandle> {
         // Lock the processed image buffer
         let img = self.processed_image.lock().unwrap();
+
+        if img.is_empty() {
+            return None;
+        }
 
         // Convert the processed image to a color image
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -310,6 +488,11 @@ impl MyApp {
         {
             // Lock the processed image buffer
             let img = self.processed_image.lock().unwrap();
+
+            if img.is_empty() {
+                error!("No processed image data to save.");
+                return;
+            }
 
             // Create an ImageBuffer from the raw RGBA data
             let buffer: image::ImageBuffer<image::Rgba<u8>, _> = match
