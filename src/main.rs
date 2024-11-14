@@ -10,6 +10,7 @@ use rand::thread_rng;
 use rayon::prelude::*;
 use std::sync::{ Arc, Mutex };
 use std::path::PathBuf;
+use rfd::FileDialog; // Import rfd for file dialogs
 
 /// Your original pixel_sort function remains unchanged
 fn pixel_sort(img_buf: &[u8], img_width: usize, img_height: usize, threshold: u8) -> Vec<u8> {
@@ -153,7 +154,17 @@ impl eframe::App for MyApp {
             style.spacing.slider_width = 400.0; // Adjust this value as needed
             ui.set_style(style);
 
-            ui.heading(format!("Pixel Sorter - {}", self.image_path.as_ref().unwrap().display()));
+            // Heading with the image name
+            let image_name = if let Some(path) = &self.image_path {
+                if path.to_string_lossy().is_empty() {
+                    "No Image Loaded".to_owned()
+                } else {
+                    format!("{}", path.file_name().unwrap_or_default().to_string_lossy())
+                }
+            } else {
+                "No Image Loaded".to_owned()
+            };
+            ui.heading(format!("Pixel Sorter - {}", image_name));
 
             ui.add_space(10.0);
 
@@ -175,7 +186,7 @@ impl eframe::App for MyApp {
                     .show_value(true)
             );
 
-            if self.is_processing.lock().unwrap().clone() {
+            if *self.is_processing.lock().unwrap() {
                 ui.spinner();
             }
 
@@ -184,9 +195,7 @@ impl eframe::App for MyApp {
             // Check if the slider value has changed
             if slider.changed() {
                 info!("Threshold changed to {}", self.threshold);
-                if slider.changed() {
-                    self.process_image();
-                }
+                self.process_image();
             }
 
             ui.add_space(10.0);
@@ -204,6 +213,13 @@ impl eframe::App for MyApp {
                     // Optionally, you can add scaling or other transformations here
                     ui.add(Image::new(texture).shrink_to_fit());
                 });
+            }
+
+            ui.add_space(10.0);
+
+            // Add the "Save Image" button
+            if ui.button("Save Image").clicked() {
+                self.save_image();
             }
         });
 
@@ -237,52 +253,34 @@ impl MyApp {
 
     /// Process the image using the pixel_sort function
     fn process_image(&mut self) {
-        // // Process the image
-        // let new_image = pixel_sort(
-        //     &self.original_img_buf,
-        //     self.img_width,
-        //     self.img_height,
-        //     self.threshold
-        // );
+        // Set the processing flag
+        {
+            let mut processing = self.is_processing.lock().unwrap();
+            *processing = true;
+        }
 
-        // // Update the processed image buffer
-        // let mut img = self.processed_image.lock().unwrap();
-        // *img = new_image;
-
-        // // Reset the texture to force reload
-        // self.texture = None;
-
-        // Clone necessary data for the background thread
-        // let original_img_buf = self.original_img_buf.clone();
-        // let img_width = self.img_width;
-        // let img_height = self.img_height;
-        // let threshold = self.threshold;
-        // let processed_image = Arc::clone(&self.processed_image);
-
-        // let is_processing = Arc::clone(&self.is_processing);
-
-        // std::thread::spawn(move || {
-        //     // Set the processing flag
-        //     *is_processing.lock().unwrap() = true;
-        //     let new_image = pixel_sort(&original_img_buf, img_width, img_height, threshold);
-        //     let mut img = processed_image.lock().unwrap();
-        //     *img = new_image;
-        //     *is_processing.lock().unwrap() = false;
-        // });
-
-        // For simplicity, we'll process the image on the main thread.
-        // Note: If processing is slow, consider using the asynchronous approach above.
+        // Perform the pixel sort
         let new_image = pixel_sort(
             &self.original_img_buf,
             self.img_width,
             self.img_height,
             self.threshold
         );
-        let mut img = self.processed_image.lock().unwrap();
-        *img = new_image;
 
-        // Update the texture
-        self.texture = None; // Reset the texture to force reload
+        // Update the processed image buffer
+        {
+            let mut img = self.processed_image.lock().unwrap();
+            *img = new_image;
+        }
+
+        // Reset the texture to force reload
+        self.texture = None;
+
+        // Unset the processing flag
+        {
+            let mut processing = self.is_processing.lock().unwrap();
+            *processing = false;
+        }
     }
 
     /// Load the texture from the processed image buffer
@@ -298,6 +296,57 @@ impl MyApp {
 
         // Allocate a texture
         Some(ui.ctx().load_texture("processed_image", color_image, egui::TextureOptions::LINEAR))
+    }
+
+    /// Save the processed image to a file chosen by the user
+    fn save_image(&self) {
+        // Open a save file dialog
+        if
+            let Some(path) = FileDialog::new()
+                .add_filter("PNG Image", &["png"])
+                .add_filter("JPEG Image", &["jpg", "jpeg"])
+                .set_file_name("processed_image.png")
+                .save_file()
+        {
+            // Lock the processed image buffer
+            let img = self.processed_image.lock().unwrap();
+
+            // Create an ImageBuffer from the raw RGBA data
+            let buffer: image::ImageBuffer<image::Rgba<u8>, _> = match
+                image::ImageBuffer::from_raw(
+                    self.img_width as u32,
+                    self.img_height as u32,
+                    img.clone()
+                )
+            {
+                Some(b) => b,
+                None => {
+                    error!("Failed to create ImageBuffer from processed image data");
+                    return;
+                }
+            };
+
+            // Determine the image format based on the file extension
+            let extension = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let result = match extension.as_str() {
+                "png" => buffer.save_with_format(&path, image::ImageFormat::Png),
+                "jpg" | "jpeg" => buffer.save_with_format(&path, image::ImageFormat::Jpeg), // Quality set to 80
+                _ => {
+                    error!("Unsupported file extension: {}", extension);
+                    return;
+                }
+            };
+
+            // Handle the result of saving
+            match result {
+                Ok(_) => info!("Image saved successfully to {}", path.display()),
+                Err(e) => error!("Failed to save image to '{}': {}", path.display(), e),
+            }
+        }
     }
 }
 
